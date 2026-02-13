@@ -63,10 +63,16 @@ pub fn encode_raw(cmd: &str) -> Vec<u8> {
     format!("{cmd}\r").into_bytes()
 }
 
-/// Parse a `?NAME` response, stripping CR/LF terminators and whitespace.
+/// Parse a `?NAME` response, stripping the `NAME` prefix and CR/LF terminators.
+///
+/// Real OTRSP devices respond with `NAME<devicename>\r` (e.g. `NAMESO2Rduino\r`).
 pub fn parse_name_response(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
-    s.trim_end_matches(['\r', '\n']).trim().to_string()
+    let s = s.trim_end_matches(['\r', '\n']).trim();
+    s.strip_prefix("NAME")
+        .map(|s| s.trim())
+        .unwrap_or(s)
+        .to_string()
 }
 
 /// Parse a `?AUXpv` response into `(port, value)`.
@@ -165,10 +171,13 @@ mod tests {
 
     #[test]
     fn test_parse_name_response() {
+        // Real devices respond with NAME prefix
+        assert_eq!(parse_name_response(b"NAMESO2RDUINO\r"), "SO2RDUINO");
+        assert_eq!(parse_name_response(b"NAMERigSelect Pro\r\n"), "RigSelect Pro");
+        assert_eq!(parse_name_response(b"NAME  YCCC SO2R  \r"), "YCCC SO2R");
+        assert_eq!(parse_name_response(b"NAMEDeviceName"), "DeviceName");
+        // Graceful handling of responses without NAME prefix
         assert_eq!(parse_name_response(b"SO2RDUINO\r"), "SO2RDUINO");
-        assert_eq!(parse_name_response(b"RigSelect Pro\r\n"), "RigSelect Pro");
-        assert_eq!(parse_name_response(b"  YCCC SO2R  \r"), "YCCC SO2R");
-        assert_eq!(parse_name_response(b"DeviceName"), "DeviceName");
     }
 
     #[test]

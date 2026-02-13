@@ -58,7 +58,12 @@ impl So2rSwitch for OtrspDevice {
     async fn query_aux(&self, port: u8) -> Result<u8> {
         let data = protocol::encode_query_aux(port)?;
         let response = self.io.command_read(data).await?;
-        let (_port, value) = protocol::parse_aux_response(response.as_bytes())?;
+        let (returned_port, value) = protocol::parse_aux_response(response.as_bytes())?;
+        if returned_port != port {
+            return Err(crate::error::Error::Protocol(format!(
+                "AUX port mismatch: requested port {port}, got port {returned_port}"
+            )));
+        }
         Ok(value)
     }
 

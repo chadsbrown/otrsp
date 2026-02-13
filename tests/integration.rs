@@ -1,10 +1,10 @@
-use otrsp::{MockPort, OtrspBuilder, Radio, RxMode, So2rSwitch, SwitchEvent};
+use otrsp::{Error, MockPort, OtrspBuilder, Radio, RxMode, So2rSwitch, SwitchEvent};
 
 #[tokio::test]
 async fn build_and_query_name() {
     let mock = MockPort::new();
-    // Queue a name response for the builder's ?NAME query
-    mock.queue_read(b"SO2RDUINO\r");
+    // Queue a name response for the builder's ?NAME query (real devices send NAME prefix)
+    mock.queue_read(b"NAMESO2RDUINO\r");
 
     let device = OtrspBuilder::new("/dev/mock")
         .build_with_port(mock.clone())
@@ -109,8 +109,8 @@ async fn device_name_query_via_trait() {
         .await
         .unwrap();
 
-    // Queue a name response for the device_name() query
-    mock.queue_read(b"RigSelect Pro\r");
+    // Queue a name response for the device_name() query (real devices send NAME prefix)
+    mock.queue_read(b"NAMERigSelect Pro\r");
 
     let name = device.device_name().await.unwrap();
     assert_eq!(name, "RigSelect Pro");
@@ -217,6 +217,152 @@ async fn capabilities_defaults() {
     assert!(caps.stereo);
     assert!(caps.reverse_stereo);
     assert_eq!(caps.aux_ports, 2);
+
+    device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_aux_rejects_mismatched_port() {
+    let mock = MockPort::new();
+
+    let device = OtrspBuilder::new("/dev/mock")
+        .query_name(false)
+        .build_with_port(mock.clone())
+        .await
+        .unwrap();
+
+    // Request ?AUX1 but queue a response for port 2
+    mock.queue_read(b"AUX24\r");
+
+    let result = device.query_aux(1).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        Error::Protocol(msg) => {
+            assert!(msg.contains("mismatch"), "expected mismatch message, got: {msg}");
+        }
+        other => panic!("expected Error::Protocol, got {other:?}"),
+    }
+
+    device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_emits_disconnected_event() {
+    let mock = MockPort::new();
+
+    let device = OtrspBuilder::new("/dev/mock")
+        .query_name(false)
+        .build_with_port(mock.clone())
+        .await
+        .unwrap();
+
+    let mut rx = device.subscribe();
+
+    device.close().await.unwrap();
+
+    // The IO task should emit Disconnected on graceful shutdown
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for Disconnected event")
+        .expect("channel closed");
+    assert!(
+        matches!(event, SwitchEvent::Disconnected),
+        "expected Disconnected, got {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_error_emits_disconnected_event() {
+    let mock = MockPort::new();
+
+    let device = OtrspBuilder::new("/dev/mock")
+        .query_name(false)
+        .build_with_port(mock.clone())
+        .await
+        .unwrap();
+
+    let mut rx = device.subscribe();
+
+    // Close the mock port to force a read error, then query
+    mock.close();
+
+    let _ = device.query_aux(1).await;
+
+    // Should receive Disconnected from the read error path
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for Disconnected event")
+        .expect("channel closed");
+    assert!(
+        matches!(event, SwitchEvent::Disconnected),
+        "expected Disconnected, got {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn single_disconnected_event_on_failure() {
+    let mock = MockPort::new();
+
+    let device = OtrspBuilder::new("/dev/mock")
+        .query_name(false)
+        .build_with_port(mock.clone())
+        .await
+        .unwrap();
+
+    let mut rx = device.subscribe();
+
+    // Close mock to force errors
+    mock.close();
+
+    // Trigger two commands that will both fail
+    let _ = device.set_tx(Radio::Radio1).await;
+    let _ = device.set_tx(Radio::Radio2).await;
+    device.close().await.unwrap();
+
+    // Collect all Disconnected events (drain with short timeout)
+    let mut disconnect_count = 0;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(SwitchEvent::Disconnected)) => disconnect_count += 1,
+            Ok(Ok(_)) => {} // skip non-disconnect events
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        disconnect_count, 1,
+        "expected exactly 1 Disconnected event, got {disconnect_count}"
+    );
+}
+
+#[tokio::test]
+async fn build_name_timeout_does_not_corrupt_next_query() {
+    let mock = MockPort::new();
+
+    // Don't queue any data — the ?NAME query will time out via the IO task.
+    let device = OtrspBuilder::new("/dev/mock")
+        .build_with_port(mock.clone())
+        .await
+        .unwrap();
+
+    // Name should be "Unknown" since the query timed out
+    assert_eq!(device.info().name, "Unknown");
+
+    // Simulate stale NAME bytes that arrived late (after timeout).
+    // These are now sitting in the port buffer.
+    mock.queue_read(b"NAMESO2RDUINO\r");
+
+    // Queue the real AUX response with a short delay so the drain
+    // can distinguish stale data (already buffered) from the legitimate
+    // response (arrives after the command is sent).
+    let mock2 = mock.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        mock2.queue_read(b"AUX14\r");
+    });
+
+    let value = device.query_aux(1).await.unwrap();
+    assert_eq!(value, 4, "AUX query should not be corrupted by late NAME response");
 
     device.close().await.unwrap();
 }

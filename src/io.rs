@@ -127,6 +127,8 @@ async fn io_loop<P>(
     P: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     debug!("IO task started");
+    let mut disconnected_sent = false;
+    let mut needs_drain = false;
 
     loop {
         tokio::select! {
@@ -142,10 +144,10 @@ async fn io_loop<P>(
                     Some(Request::Shutdown { reply }) => {
                         debug!("IO task shutdown requested");
                         let _ = reply.send(Ok(()));
-                        return;
+                        break;
                     }
                     Some(req) => {
-                        handle_request(req, &mut port, &event_tx).await;
+                        handle_request(req, &mut port, &event_tx, &mut disconnected_sent, &mut needs_drain).await;
                     }
                     None => {
                         debug!("channel closed");
@@ -156,13 +158,20 @@ async fn io_loop<P>(
         }
     }
 
-    let _ = event_tx.send(SwitchEvent::Disconnected);
+    if !disconnected_sent {
+        let _ = event_tx.send(SwitchEvent::Disconnected);
+    }
     debug!("IO task exiting");
 }
 
 /// Handle a single request.
-async fn handle_request<P>(req: Request, port: &mut P, event_tx: &broadcast::Sender<SwitchEvent>)
-where
+async fn handle_request<P>(
+    req: Request,
+    port: &mut P,
+    event_tx: &broadcast::Sender<SwitchEvent>,
+    disconnected_sent: &mut bool,
+    needs_drain: &mut bool,
+) where
     P: AsyncRead + AsyncWrite + Send + Unpin,
 {
     match req {
@@ -170,16 +179,28 @@ where
             trace!("writing {} bytes: {:02X?}", data.len(), data);
             let result = port.write_all(&data).await.map_err(|e| {
                 error!("write error: {e}");
-                let _ = event_tx.send(SwitchEvent::Disconnected);
+                if !*disconnected_sent {
+                    let _ = event_tx.send(SwitchEvent::Disconnected);
+                    *disconnected_sent = true;
+                }
                 Error::Io(e)
             });
             let _ = reply.send(result);
         }
         Request::WriteAndRead { data, reply } => {
             trace!("write+read {} bytes", data.len());
+            // Drain stale bytes from a previous timed-out read before sending
+            // a new command. Anything in the buffer now is from a prior response.
+            if *needs_drain {
+                drain_stale(port).await;
+                *needs_drain = false;
+            }
             if let Err(e) = port.write_all(&data).await {
                 error!("write error: {e}");
-                let _ = event_tx.send(SwitchEvent::Disconnected);
+                if !*disconnected_sent {
+                    let _ = event_tx.send(SwitchEvent::Disconnected);
+                    *disconnected_sent = true;
+                }
                 let _ = reply.send(Err(Error::Io(e)));
                 return;
             }
@@ -190,16 +211,42 @@ where
                 }
                 Ok(Err(e)) => {
                     error!("read error: {e}");
+                    if !*disconnected_sent {
+                        let _ = event_tx.send(SwitchEvent::Disconnected);
+                        *disconnected_sent = true;
+                    }
                     let _ = reply.send(Err(Error::Io(e)));
                 }
                 Err(_) => {
                     warn!("read timeout waiting for response");
+                    *needs_drain = true;
                     let _ = reply.send(Err(Error::Timeout));
                 }
             }
         }
         Request::Shutdown { reply } => {
             let _ = reply.send(Ok(()));
+        }
+    }
+}
+
+/// Drain any stale bytes from the port buffer.
+///
+/// Called before `WriteAndRead` to clear bytes left over from a previous
+/// timed-out read. Uses a very short timeout since we only want bytes
+/// that are already buffered, not future data.
+async fn drain_stale<P>(port: &mut P)
+where
+    P: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 64];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(1), port.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                debug!("drained {n} stale bytes");
+                continue;
+            }
+            _ => break,
         }
     }
 }
