@@ -233,15 +233,25 @@ async fn handle_request<P>(
 /// Drain any stale bytes from the port buffer.
 ///
 /// Called before `WriteAndRead` to clear bytes left over from a previous
-/// timed-out read. Uses a very short timeout since we only want bytes
-/// that are already buffered, not future data.
+/// timed-out read. Uses a bounded total window (200ms) with a per-read
+/// idle cutoff (20ms) so that late-arriving serial bytes are reliably
+/// consumed before the next command is sent.
 async fn drain_stale<P>(port: &mut P)
 where
     P: AsyncRead + Unpin,
 {
     let mut buf = [0u8; 64];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+    let idle_cutoff = std::time::Duration::from_millis(20);
+
     loop {
-        match tokio::time::timeout(std::time::Duration::from_millis(1), port.read(&mut buf)).await {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            debug!("drain: total window expired");
+            break;
+        }
+        let timeout = remaining.min(idle_cutoff);
+        match tokio::time::timeout(timeout, port.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 debug!("drained {n} stale bytes");
                 continue;

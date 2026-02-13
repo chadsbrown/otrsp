@@ -283,8 +283,9 @@ async fn read_error_emits_disconnected_event() {
 
     let mut rx = device.subscribe();
 
-    // Close the mock port to force a read error, then query
-    mock.close();
+    // Close only the read side so that write_all succeeds but the
+    // subsequent read fails — exercising the read-error branch.
+    mock.close_read();
 
     let _ = device.query_aux(1).await;
 

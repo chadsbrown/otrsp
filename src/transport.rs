@@ -34,6 +34,8 @@ struct MockState {
     write_log: Vec<u8>,
     /// Whether the port is "closed".
     closed: bool,
+    /// Whether only the read side is closed (writes still succeed).
+    read_closed: bool,
     /// Waker to notify when new data is queued.
     read_waker: Option<Waker>,
 }
@@ -55,6 +57,7 @@ impl MockPort {
                 read_buf: Vec::new(),
                 write_log: Vec::new(),
                 closed: false,
+                read_closed: false,
                 read_waker: None,
             })),
         }
@@ -88,6 +91,19 @@ impl MockPort {
             waker.wake();
         }
     }
+
+    /// Close only the read side (writes still succeed).
+    ///
+    /// This simulates a half-broken connection where the host can still
+    /// send data but receives no response — useful for testing the
+    /// read-error code path in `WriteAndRead`.
+    pub fn close_read(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.read_closed = true;
+        if let Some(waker) = state.read_waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl Default for MockPort {
@@ -103,7 +119,7 @@ impl AsyncRead for MockPort {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = self.state.lock().unwrap();
-        if state.closed {
+        if state.closed || state.read_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "mock port closed",
