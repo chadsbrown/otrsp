@@ -1,0 +1,18 @@
+[package]
+name = "otrsp"
+version = "0.1.0"
+edition = "2024"
+description = "Async Rust library for the Open Two Radio Switching Protocol (OTRSP)"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "io-util"] }
+tokio-util = "0.7"
+tokio-serial = "5.4"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
